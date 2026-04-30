@@ -1,40 +1,971 @@
-# app.py - Complete working code for Render deployment (No Selenium required)
-import streamlit as st
+# app.py - Complete Facebook Message Automation System for Render
+
+import os
 import time
 import threading
-import hashlib
-import os
+import json
 import sqlite3
-from contextlib import contextmanager
+import hashlib
+import secrets
 from datetime import datetime
 from pathlib import Path
+from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 
-# ==================== PAGE CONFIGURATION ====================
-st.set_page_config(
-    page_title="ASHIQ RAJ - R4J M1SHR4",
-    page_icon="🔥",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
 
-# ==================== DATABASE SETUP ====================
-DB_PATH = os.environ.get('DATABASE_PATH', '/data/users.db')
+# Database setup
+def init_db():
+    conn = sqlite3.connect('automation.db')
+    c = conn.cursor()
+    
+    # Users table
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        is_admin INTEGER DEFAULT 0
+    )''')
+    
+    # User configs table
+    c.execute('''CREATE TABLE IF NOT EXISTS user_configs (
+        user_id INTEGER PRIMARY KEY,
+        chat_id TEXT,
+        name_prefix TEXT,
+        delay INTEGER DEFAULT 5,
+        cookies TEXT,
+        messages TEXT,
+        automation_running INTEGER DEFAULT 0,
+        admin_thread_id TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    )''')
+    
+    # Create admin user if not exists
+    admin_password = hashlib.sha256("admin123".encode()).hexdigest()
+    c.execute("INSERT OR IGNORE INTO users (id, username, password, is_admin) VALUES (1, 'admin', ?, 1)", (admin_password,))
+    
+    conn.commit()
+    conn.close()
 
-# Ensure data directory exists
-try:
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-except:
-    os.makedirs('data', exist_ok=True)
-    DB_PATH = 'data/users.db'
+init_db()
 
-@contextmanager
+# HTML Template
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>R4J M1SHR4 - Facebook Automation</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700;800&display=swap');
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Poppins', sans-serif;
+        }
+        
+        body {
+            background: linear-gradient(135deg, #fff5f5 0%, #ffe0f0 25%, #ffe6cc 50%, #e8f5e9 75%, #e3f2fd 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        /* Header Styles */
+        .main-header {
+            background: linear-gradient(135deg, #ff6b9d 0%, #ff1493 50%, #dc143c 100%);
+            padding: 3rem 2rem;
+            border-radius: 25px;
+            text-align: center;
+            margin-bottom: 2rem;
+            box-shadow: 0 15px 40px rgba(255, 20, 147, 0.3);
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .main-header::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(45deg, transparent 30%, rgba(255,255,255,0.1) 50%, transparent 70%);
+            animation: shine 3s infinite;
+        }
+        
+        @keyframes shine {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(100%); }
+        }
+        
+        .main-header h1 {
+            color: white;
+            font-size: 3rem;
+            font-weight: 800;
+            text-shadow: 3px 3px 10px rgba(0, 0, 0, 0.3);
+        }
+        
+        .main-header p {
+            color: rgba(255, 255, 255, 0.95);
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin-top: 0.5rem;
+        }
+        
+        /* Card Styles */
+        .card {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 25px;
+            margin-bottom: 25px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.15);
+        }
+        
+        /* Different colored borders for different sections */
+        .card-config { border: 3px solid #ff1493; }
+        .card-automation { border: 3px solid #4caf50; }
+        .card-logs { border: 3px solid #ff9800; }
+        .card-stats { border: 3px solid #2196f3; }
+        .card-info { border: 3px solid #9c27b0; }
+        
+        .card-title {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #ddd;
+        }
+        
+        .card-config .card-title { color: #ff1493; }
+        .card-automation .card-title { color: #4caf50; }
+        .card-logs .card-title { color: #ff9800; }
+        .card-stats .card-title { color: #2196f3; }
+        
+        /* Form Styles */
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: #333;
+        }
+        
+        input, textarea, select {
+            width: 100%;
+            padding: 12px 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 12px;
+            font-size: 14px;
+            transition: all 0.3s ease;
+            background: rgba(255, 255, 255, 0.9);
+        }
+        
+        input:focus, textarea:focus, select:focus {
+            outline: none;
+            border-color: #ff1493;
+            box-shadow: 0 0 0 3px rgba(255, 20, 147, 0.1);
+        }
+        
+        textarea {
+            resize: vertical;
+            min-height: 100px;
+        }
+        
+        /* Button Styles */
+        .btn {
+            padding: 12px 30px;
+            border: none;
+            border-radius: 12px;
+            font-weight: 600;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, #ff6b9d 0%, #ff1493 100%);
+            color: white;
+            box-shadow: 0 4px 15px rgba(255, 20, 147, 0.3);
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(255, 20, 147, 0.4);
+        }
+        
+        .btn-success {
+            background: linear-gradient(135deg, #4caf50 0%, #45a049 100%);
+            color: white;
+        }
+        
+        .btn-danger {
+            background: linear-gradient(135deg, #f44336 0%, #d32f2f 100%);
+            color: white;
+        }
+        
+        .btn-warning {
+            background: linear-gradient(135deg, #ff9800 0%, #f57c00 100%);
+            color: white;
+        }
+        
+        .btn-secondary {
+            background: linear-gradient(135deg, #9c27b0 0%, #7b1fa2 100%);
+            color: white;
+        }
+        
+        .btn-sm {
+            padding: 8px 20px;
+            font-size: 12px;
+        }
+        
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .stat-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            border-radius: 15px;
+            text-align: center;
+            color: white;
+        }
+        
+        .stat-card.green { background: linear-gradient(135deg, #84fab0 0%, #8fd3f4 100%); color: #333; }
+        .stat-card.pink { background: linear-gradient(135deg, #ff6b9d 0%, #ff1493 100%); }
+        .stat-card.orange { background: linear-gradient(135deg, #fa709a 0%, #fee140 100%); color: #333; }
+        .stat-card.blue { background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); color: #333; }
+        
+        .stat-value {
+            font-size: 2.5rem;
+            font-weight: 800;
+        }
+        
+        .stat-label {
+            font-size: 0.9rem;
+            font-weight: 600;
+            margin-top: 5px;
+        }
+        
+        /* Console Styles */
+        .console {
+            background: #1a1a1a;
+            border-radius: 15px;
+            padding: 20px;
+            max-height: 400px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+        }
+        
+        .console-line {
+            color: #00ff88;
+            padding: 8px 12px;
+            margin: 5px 0;
+            border-left: 3px solid #ff1493;
+            background: rgba(255, 20, 147, 0.05);
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+        }
+        
+        .console-line::before {
+            content: '►';
+            color: #ff1493;
+            margin-right: 10px;
+        }
+        
+        .console-line.error {
+            color: #ff4444;
+            border-left-color: #ff4444;
+        }
+        
+        .console-line.success {
+            color: #00ff88;
+            border-left-color: #00ff88;
+        }
+        
+        /* Alert Styles */
+        .alert {
+            padding: 15px 20px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            font-weight: 600;
+        }
+        
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border: 2px solid #28a745;
+        }
+        
+        .alert-error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 2px solid #dc3545;
+        }
+        
+        .alert-warning {
+            background: #fff3cd;
+            color: #856404;
+            border: 2px solid #ffc107;
+        }
+        
+        /* Two column layout */
+        .row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+            gap: 25px;
+        }
+        
+        /* Footer */
+        .footer {
+            text-align: center;
+            padding: 2rem;
+            margin-top: 2rem;
+            background: rgba(255, 255, 255, 0.9);
+            border-radius: 20px;
+            border-top: 3px solid #ff1493;
+            font-weight: 700;
+            color: #ff1493;
+        }
+        
+        /* Navbar */
+        .navbar {
+            background: rgba(255, 255, 255, 0.95);
+            padding: 15px 25px;
+            border-radius: 15px;
+            margin-bottom: 25px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border: 2px solid #ffb6c1;
+        }
+        
+        .navbar-brand {
+            font-size: 1.5rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #ff6b9d 0%, #ff1493 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .navbar-user {
+            font-weight: 600;
+            color: #ff1493;
+        }
+        
+        /* Responsive */
+        @media (max-width: 768px) {
+            .row {
+                grid-template-columns: 1fr;
+            }
+            
+            .main-header h1 {
+                font-size: 2rem;
+            }
+            
+            .stats-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+        
+        /* Status badge */
+        .status-badge {
+            display: inline-block;
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 700;
+        }
+        
+        .status-running {
+            background: #4caf50;
+            color: white;
+            animation: pulse 1s infinite;
+        }
+        
+        .status-stopped {
+            background: #f44336;
+            color: white;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        {% if not session.logged_in %}
+        <!-- Login Page -->
+        <div class="main-header">
+            <h1>🔥 R4J M1SHR4 🔥</h1>
+            <p>PREMIUM FACEBOOK MESSAGE AUTOMATION TOOL</p>
+        </div>
+        
+        <div class="row">
+            <div class="card card-config">
+                <div class="card-title">🔐 LOGIN</div>
+                <form method="POST" action="/login">
+                    <div class="form-group">
+                        <label>USERNAME</label>
+                        <input type="text" name="username" required placeholder="Enter your username">
+                    </div>
+                    <div class="form-group">
+                        <label>PASSWORD</label>
+                        <input type="password" name="password" required placeholder="Enter your password">
+                    </div>
+                    <button type="submit" class="btn btn-primary" style="width: 100%;">LOGIN</button>
+                </form>
+            </div>
+            
+            <div class="card card-automation">
+                <div class="card-title">✨ SIGN UP</div>
+                <form method="POST" action="/signup">
+                    <div class="form-group">
+                        <label>USERNAME</label>
+                        <input type="text" name="username" required placeholder="Choose a username">
+                    </div>
+                    <div class="form-group">
+                        <label>PASSWORD</label>
+                        <input type="password" name="password" required placeholder="Create a password">
+                    </div>
+                    <div class="form-group">
+                        <label>CONFIRM PASSWORD</label>
+                        <input type="password" name="confirm_password" required placeholder="Confirm password">
+                    </div>
+                    <button type="submit" class="btn btn-success" style="width: 100%;">CREATE ACCOUNT</button>
+                </form>
+            </div>
+        </div>
+        
+        {% else %}
+        
+        <!-- Main App -->
+        <div class="navbar">
+            <div class="navbar-brand">🔥 R4J M1SHR4</div>
+            <div class="navbar-user">
+                👤 {{ session.username }}
+                {% if session.is_admin %} 👑 ADMIN {% endif %}
+            </div>
+            <a href="/logout" class="btn btn-danger btn-sm">🚪 LOGOUT</a>
+        </div>
+        
+        {% if message %}
+        <div class="alert alert-{{ message_type }}">{{ message }}</div>
+        {% endif %}
+        
+        <!-- Stats Section -->
+        <div class="stats-grid">
+            <div class="stat-card green">
+                <div class="stat-value">{{ stats.messages_sent }}</div>
+                <div class="stat-label">MESSAGES SENT</div>
+            </div>
+            <div class="stat-card pink">
+                <div class="stat-value">{{ stats.status_text }}</div>
+                <div class="stat-label">STATUS</div>
+            </div>
+            <div class="stat-card orange">
+                <div class="stat-value">{{ stats.chat_id_short }}</div>
+                <div class="stat-label">CHAT ID</div>
+            </div>
+            <div class="stat-card blue">
+                <div class="stat-value">{{ stats.delay }}s</div>
+                <div class="stat-label">DELAY</div>
+            </div>
+        </div>
+        
+        <div class="row">
+            <!-- Configuration Section -->
+            <div class="card card-config">
+                <div class="card-title">⚙️ CONFIGURATION SETTINGS</div>
+                <form method="POST" action="/save_config">
+                    <div class="form-group">
+                        <label>CHAT/CONVERSATION ID</label>
+                        <input type="text" name="chat_id" value="{{ config.chat_id }}" placeholder="e.g., 1362400298935018">
+                    </div>
+                    <div class="form-group">
+                        <label>NAME PREFIX</label>
+                        <input type="text" name="name_prefix" value="{{ config.name_prefix }}" placeholder="e.g., [R4J M1SHR4]">
+                    </div>
+                    <div class="form-group">
+                        <label>DELAY (SECONDS)</label>
+                        <input type="number" name="delay" value="{{ config.delay }}" min="1" max="300">
+                    </div>
+                    <div class="form-group">
+                        <label>FACEBOOK COOKIES (OPTIONAL)</label>
+                        <textarea name="cookies" placeholder="Paste your Facebook cookies here (will be encrypted)">{{ config.cookies }}</textarea>
+                    </div>
+                    <div class="form-group">
+                        <label>MESSAGES (ONE PER LINE)</label>
+                        <textarea name="messages" placeholder="Enter your messages here, one per line">{{ config.messages }}</textarea>
+                    </div>
+                    <button type="submit" class="btn btn-primary" style="width: 100%;">💾 SAVE CONFIGURATION</button>
+                </form>
+            </div>
+            
+            <!-- Automation Control Section -->
+            <div class="card card-automation">
+                <div class="card-title">🚀 AUTOMATION CONTROL</div>
+                
+                <div style="display: flex; gap: 15px; margin-bottom: 20px;">
+                    {% if not automation_running %}
+                    <form method="POST" action="/start" style="flex: 1;">
+                        <button type="submit" class="btn btn-success" style="width: 100%;" {% if not config.chat_id %}disabled{% endif %}>
+                            ▶️ START AUTOMATION
+                        </button>
+                    </form>
+                    {% else %}
+                    <form method="POST" action="/stop" style="flex: 1;">
+                        <button type="submit" class="btn btn-danger" style="width: 100%;">
+                            ⏹️ STOP AUTOMATION
+                        </button>
+                    </form>
+                    {% endif %}
+                    
+                    <form method="POST" action="/refresh" style="flex: 1;">
+                        <button type="submit" class="btn btn-warning" style="width: 100%;">
+                            🔄 REFRESH
+                        </button>
+                    </form>
+                </div>
+                
+                <div class="form-group">
+                    <label>AUTOMATION STATUS</label>
+                    <div>
+                        <span class="status-badge {% if automation_running %}status-running{% else %}status-stopped{% endif %}">
+                            {% if automation_running %}RUNNING{% else %}STOPPED{% endif %}
+                        </span>
+                    </div>
+                </div>
+                
+                {% if not config.chat_id %}
+                <div class="alert alert-warning">
+                    ⚠️ Please set a Chat ID in configuration before starting automation!
+                </div>
+                {% endif %}
+            </div>
+        </div>
+        
+        <!-- Live Console Section -->
+        <div class="card card-logs">
+            <div class="card-title">📺 LIVE CONSOLE OUTPUT</div>
+            <div class="console" id="console">
+                {% for log in logs %}
+                <div class="console-line">{{ log }}</div>
+                {% endfor %}
+            </div>
+            <div style="margin-top: 15px; text-align: center;">
+                <small>🟢 Live monitoring active - Auto-refreshing every 3 seconds</small>
+            </div>
+        </div>
+        
+        <!-- Info Section -->
+        <div class="card card-info">
+            <div class="card-title">ℹ️ SYSTEM INFORMATION</div>
+            <div class="row">
+                <div class="form-group">
+                    <label>LAST UPDATE</label>
+                    <input type="text" value="{{ last_update }}" readonly>
+                </div>
+                <div class="form-group">
+                    <label>SESSION ID</label>
+                    <input type="text" value="{{ session.session_id }}" readonly>
+                </div>
+            </div>
+        </div>
+        
+        <script>
+            // Auto-refresh console every 3 seconds
+            setInterval(function() {
+                fetch('/get_logs')
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.logs) {
+                            const consoleDiv = document.getElementById('console');
+                            consoleDiv.innerHTML = data.logs.map(log => `<div class="console-line">${log}</div>`).join('');
+                            consoleDiv.scrollTop = consoleDiv.scrollHeight;
+                        }
+                        if (data.stats) {
+                            document.querySelector('.stat-value').textContent = data.stats.messages_sent;
+                        }
+                    });
+            }, 3000);
+        </script>
+        
+        {% endif %}
+        
+        <div class="footer">
+            MADE WITH ❤️ BY R4J M1SHR4 | © 2025
+        </div>
+    </div>
+</body>
+</html>
+'''
+
+# Automation State
+class AutomationState:
+    def __init__(self):
+        self.running = False
+        self.message_count = 0
+        self.logs = []
+        self.message_rotation_index = 0
+        self.thread = None
+
+automation_state = AutomationState()
+
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect('automation.db')
     conn.row_factory = sqlite3.Row
+    return conn
+
+def log_message(msg, is_error=False, is_success=False):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    formatted_msg = f"[{timestamp}] {msg}"
+    automation_state.logs.append(formatted_msg)
+    if len(automation_state.logs) > 200:
+        automation_state.logs = automation_state.logs[-200:]
+    print(formatted_msg)
+
+def setup_browser():
+    chrome_options = Options()
+    chrome_options.add_argument('--headless=new')
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-setuid-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument('--window-size=1920,1080')
+    chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+    
+    driver = webdriver.Chrome(options=chrome_options)
+    return driver
+
+def find_message_input(driver, process_id):
+    log_message(f'{process_id}: Finding message input...')
+    time.sleep(8)
+    
+    selectors = [
+        'div[contenteditable="true"][role="textbox"]',
+        'div[contenteditable="true"]',
+        '[role="textbox"][contenteditable="true"]',
+        'textarea[placeholder*="message" i]',
+        'textarea'
+    ]
+    
+    for selector in selectors:
+        try:
+            elements = driver.find_elements(By.CSS_SELECTOR, selector)
+            for element in elements:
+                if element.is_displayed():
+                    return element
+        except:
+            continue
+    return None
+
+def send_messages_automation(user_id):
+    conn = get_db_connection()
+    config = conn.execute("SELECT * FROM user_configs WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    
+    if not config or not config['chat_id']:
+        return
+    
+    driver = None
     try:
-        yield conn
-        conn.commit()
+        driver = setup_browser()
+        driver.get('https://www.facebook.com/')
+        time.sleep(8)
+        
+        if config['cookies']:
+            cookie_array = config['cookies'].split(';')
+            for cookie in cookie_array:
+                if '=' in cookie:
+                    name, value = cookie.strip().split('=', 1)
+                    try:
+                        driver.add_cookie({'name': name, 'value': value, 'domain': '.facebook.com'})
+                    except:
+                        pass
+        
+        chat_id = config['chat_id'].strip()
+        driver.get(f'https://www.facebook.com/messages/t/{chat_id}')
+        time.sleep(15)
+        
+        message_input = find_message_input(driver, 'AUTO')
+        if not message_input:
+            log_message(f'Message input not found!')
+            automation_state.running = False
+            return
+        
+        messages_list = [msg.strip() for msg in config['messages'].split('\n') if msg.strip()]
+        if not messages_list:
+            messages_list = ['Hello!']
+        
+        delay = int(config['delay'])
+        
+        while automation_state.running:
+            message = messages_list[automation_state.message_rotation_index % len(messages_list)]
+            automation_state.message_rotation_index += 1
+            
+            if config['name_prefix']:
+                message = f"{config['name_prefix']} {message}"
+            
+            try:
+                driver.execute_script("""
+                    arguments[0].focus();
+                    arguments[0].click();
+                    arguments[0].textContent = arguments[1];
+                    arguments[0].dispatchEvent(new Event('input', { bubbles: true }));
+                """, message_input, message)
+                
+                time.sleep(1)
+                
+                send_button = driver.find_elements(By.CSS_SELECTOR, '[aria-label*="Send" i]')
+                if send_button:
+                    send_button[0].click()
+                else:
+                    driver.execute_script("""
+                        var event = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13 });
+                        arguments[0].dispatchEvent(event);
+                    """, message_input)
+                
+                automation_state.message_count += 1
+                log_message(f'✓ Message #{automation_state.message_count} sent: "{message[:50]}"')
+                
+                conn = get_db_connection()
+                conn.execute("UPDATE user_configs SET messages_sent = ? WHERE user_id = ?", 
+                           (automation_state.message_count, user_id))
+                conn.commit()
+                conn.close()
+                
+                time.sleep(delay)
+                
+            except Exception as e:
+                log_message(f'Error sending: {str(e)[:100]}')
+                time.sleep(5)
+        
+    except Exception as e:
+        log_message(f'Fatal error: {str(e)}')
     finally:
+        if driver:
+            driver.quit()
+        automation_state.running = False
+        conn = get_db_connection()
+        conn.execute("UPDATE user_configs SET automation_running = 0 WHERE user_id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+
+# Flask Routes
+@app.route('/')
+def index():
+    if not session.get('logged_in'):
+        return render_template_string(HTML_TEMPLATE, session=session)
+    
+    conn = get_db_connection()
+    config = conn.execute("SELECT * FROM user_configs WHERE user_id = ?", (session['user_id'],)).fetchone()
+    if not config:
+        conn.execute("INSERT INTO user_configs (user_id, chat_id, name_prefix, delay, cookies, messages, automation_running) VALUES (?, ?, ?, ?, ?, ?, 0)",
+                    (session['user_id'], '', '', 5, '', 'Hello!\nHow are you?\nNice to meet you!'))
+        conn.commit()
+        config = conn.execute("SELECT * FROM user_configs WHERE user_id = ?", (session['user_id'],)).fetchone()
+    
+    conn.close()
+    
+    stats = {
+        'messages_sent': automation_state.message_count,
+        'status_text': 'RUNNING' if automation_state.running else 'STOPPED',
+        'chat_id_short': config['chat_id'][:12] + '...' if config['chat_id'] and len(config['chat_id']) > 12 else config['chat_id'] or 'NOT SET',
+        'delay': config['delay']
+    }
+    
+    return render_template_string(HTML_TEMPLATE, 
+                                 session=session,
+                                 config=config,
+                                 stats=stats,
+                                 automation_running=automation_state.running,
+                                 logs=automation_state.logs[-50:],
+                                 last_update=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                 message=None,
+                                 message_type=None)
+
+@app.route('/login', methods=['POST'])
+def login():
+    username = request.form.get('username')
+    password = request.form.get('password')
+    
+    hashed = hashlib.sha256(password.encode()).hexdigest()
+    conn = get_db_connection()
+    user = conn.execute("SELECT * FROM users WHERE username = ? AND password = ?", (username, hashed)).fetchone()
+    conn.close()
+    
+    if user:
+        session['logged_in'] = True
+        session['user_id'] = user['id']
+        session['username'] = user['username']
+        session['is_admin'] = user['is_admin']
+        session['session_id'] = secrets.token_hex(8)
+        return redirect('/')
+    
+    return render_template_string(HTML_TEMPLATE, 
+                                 session=session,
+                                 message="Invalid username or password!",
+                                 message_type="error")
+
+@app.route('/signup', methods=['POST'])
+def signup():
+    username = request.form.get('username')
+    password = request.form.get('password')
+    confirm = request.form.get('confirm_password')
+    
+    if password != confirm:
+        return render_template_string(HTML_TEMPLATE, 
+                                     session=session,
+                                     message="Passwords do not match!",
+                                     message_type="error")
+    
+    hashed = hashlib.sha256(password.encode()).hexdigest()
+    conn = get_db_connection()
+    
+    try:
+        conn.execute("INSERT INTO users (username, password, is_admin) VALUES (?, ?, 0)", (username, hashed))
+        conn.commit()
+        conn.close()
+        return render_template_string(HTML_TEMPLATE, 
+                                     session=session,
+                                     message="Account created successfully! Please login.",
+                                     message_type="success")
+    except sqlite3.IntegrityError:
+        conn.close()
+        return render_template_string(HTML_TEMPLATE, 
+                                     session=session,
+                                     message="Username already exists!",
+                                     message_type="error")
+
+@app.route('/save_config', methods=['POST'])
+def save_config():
+    if not session.get('logged_in'):
+        return redirect('/')
+    
+    chat_id = request.form.get('chat_id', '')
+    name_prefix = request.form.get('name_prefix', '')
+    delay = int(request.form.get('delay', 5))
+    cookies = request.form.get('cookies', '')
+    messages = request.form.get('messages', 'Hello!\nHow are you?')
+    
+    conn = get_db_connection()
+    conn.execute("""
+        UPDATE user_configs 
+        SET chat_id = ?, name_prefix = ?, delay = ?, cookies = ?, messages = ?
+        WHERE user_id = ?
+    """, (chat_id, name_prefix, delay, cookies, messages, session['user_id']))
+    conn.commit()
+    conn.close()
+    
+    return redirect('/')
+
+@app.route('/start', methods=['POST'])
+def start_automation_route():
+    if not session.get('logged_in'):
+        return redirect('/')
+    
+    if automation_state.running:
+        return redirect('/')
+    
+    conn = get_db_connection()
+    config = conn.execute("SELECT * FROM user_configs WHERE user_id = ?", (session['user_id'],)).fetchone()
+    conn.close()
+    
+    if not config or not config['chat_id']:
+        return redirect('/')
+    
+    automation_state.running = True
+    automation_state.message_count = 0
+    automation_state.message_rotation_index = 0
+    
+    conn = get_db_connection()
+    conn.execute("UPDATE user_configs SET automation_running = 1 WHERE user_id = ?", (session['user_id'],))
+    conn.commit()
+    conn.close()
+    
+    log_message(f"🚀 Automation started by {session['username']}")
+    
+    automation_state.thread = threading.Thread(target=send_messages_automation, args=(session['user_id'],))
+    automation_state.thread.daemon = True
+    automation_state.thread.start()
+    
+    return redirect('/')
+
+@app.route('/stop', methods=['POST'])
+def stop_automation_route():
+    if not session.get('logged_in'):
+        return redirect('/')
+    
+    automation_state.running = False
+    log_message(f"⏹️ Automation stopped by {session['username']}")
+    
+    conn = get_db_connection()
+    conn.execute("UPDATE user_configs SET automation_running = 0 WHERE user_id = ?", (session['user_id'],))
+    conn.commit()
+    conn.close()
+    
+    return redirect('/')
+
+@app.route('/refresh', methods=['POST'])
+def refresh():
+    return redirect('/')
+
+@app.route('/get_logs')
+def get_logs():
+    return jsonify({
+        'logs': automation_state.logs[-30:],
+        'stats': {
+            'messages_sent': automation_state.message_count,
+            'running': automation_state.running
+        }
+    })
+
+@app.route('/logout')
+def logout():
+    if automation_state.running:
+        automation_state.running = False
+        conn = get_db_connection()
+        conn.execute("UPDATE user_configs SET automation_running = 0 WHERE user_id = ?", (session.get('user_id'),))
+        conn.commit()
+        conn.close()
+    
+    session.clear()
+    return redirect('/')
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)    finally:
         conn.close()
 
 def init_db():
